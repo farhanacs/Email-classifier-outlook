@@ -42,20 +42,19 @@ def get_emails(token, count=10):
     response = requests.get(url, headers=headers)
     return response.json().get("value", [])
 
-
 def create_draft_reply(token, message_id, draft_body):
     url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}/createReply"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-    
+
     print(f"\n--- CREATE DRAFT REPLY ---")
     print(f"Message ID: {message_id}")
     print(f"URL: {url}")
-    
+
     response = requests.post(url, headers=headers)
-    
+
     print(f"Create Reply Status Code: {response.status_code}")
     print(f"Create Reply Response: {response.text}")
 
@@ -72,18 +71,20 @@ def create_draft_reply(token, message_id, draft_body):
         "body": {
             "contentType": "Text",
             "content": draft_body
-        }
+        },
+        "categories": ["AI generated"],
+        "subject": draft.get("subject", "")
     }
-    
+
     print(f"Update URL: {update_url}")
     print(f"Draft Body Preview: {draft_body[:200]}")
 
     update_response = requests.patch(update_url, headers=headers, json=update_payload)
-    
+
     print(f"Update Status Code: {update_response.status_code}")
     print(f"Update Response: {update_response.text}")
     print(f"--- END CREATE DRAFT REPLY ---\n")
-    
+
     return update_response.json()
 
 
@@ -98,6 +99,8 @@ Emails that DO NOT need a response:
 - Simple acknowledgements like got it sounds good great
 - One word or one line replies with no question or request
 - Payment confirmation notifications with no question
+- Internal emails between IET Labs staff members
+- Emails sent from an ietlabs.com email address to another ietlabs.com address
 
 Emails that DO need a response:
 - RFQ requests asking for a quote on a product
@@ -121,22 +124,40 @@ Body: {body[:2000]}"""
 
     return response.content[0].parsed_output
 
-
-# ── AGENT 2: DRAFTING ────────────────────────────────────────────────────────
 def draft_response(subject, body, sender) -> DraftResult:
     prompt = f"""You are a helpful assistant drafting email responses on behalf of IET Labs, a world leading manufacturer of test and measurement equipment including resistors capacitors and inductors.
 
 Draft a professional and concise response to the following email.
 
-Guidelines:
-- Be professional but friendly
-- Keep it concise and to the point
-- If it is an RFQ acknowledge the request and let them know the team will get back with a quote
-- If it is a service or calibration request acknowledge and ask for the serial number if not provided
-- If it is a status request acknowledge and let them know the team will look into it
-- If it is a purchase order acknowledge receipt and confirm next steps
-- Do not make up specific prices lead times or product details
-- Sign off as IET Labs Sales Team
+STRICT RULES — you must follow these without exception:
+
+1. NEVER use vague filler phrases such as:
+   - "we will look into this"
+   - "we will get back to you"
+   - "we are looking into your request"
+   - "we will follow up shortly"
+   - "we will keep you updated"
+   - "thank you for reaching out we will respond soon"
+   - Any similar non-committal language that provides no value to the customer
+   
+2. Every response must be specific and actionable. If you do not have enough information to give a specific response then ask clearly for the missing information.
+
+3. If the email requires a manual action by an IET staff member before the response can be sent such as pulling invoices checking an order printing a document or looking up a tracking number then:
+   - Set action_required to a clear instruction for the IET staff member describing exactly what they need to do before sending
+   - Write the draft_body assuming that action has already been completed
+   - For example if someone requests invoices write the response as if the invoices are already attached
+
+4. Specific guidelines per email type:
+   - RFQ: Confirm the exact product requested and state that a detailed quote including pricing and lead time is being prepared
+   - Service or calibration request: Confirm receipt of the request provide the next steps and ask for serial number if not provided
+   - Status request: Set action_required to check the order status in the system then write the response assuming you have that status
+   - Purchase order: Confirm the specific order details including product quantity and delivery and outline the next steps
+   - Invoice request: Set action_required to locate and attach the relevant invoices then write the response as if invoices are attached
+   - General question: Answer it directly and specifically
+
+5. Do not make up specific prices lead times or product details
+6. Never ask for information that has already been provided in the email. Read the full email carefully and use any details already given.
+7. Sign off as IET Labs Sales Team
 
 Email details:
 Sender: {sender}
@@ -166,11 +187,27 @@ def process_emails():
         sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
 
+        # ── SKIP INTERNAL EMAILS ──────────────────────────────────────────────
+        if sender.lower().endswith("@ietlabs.com"):
+            results.append({
+                "subject": subject,
+                "sender": sender,
+                "received": received,
+                "needs_response": False,
+                "triage_reason": "Skipped — internal IET Labs email",
+                "draft_body": None,
+                "draft_subject": None,
+                "draft_status": None,
+                "action_required": None
+            })
+            continue
+
         needs_response = False
         triage_reason = ""
         draft_body = None
         draft_subject = None
         draft_status = None
+        action_required = None
 
         try:
             triage: TriageResult = triage_email(subject, body, sender)
@@ -184,10 +221,18 @@ def process_emails():
                 draft: DraftResult = draft_response(subject, body, sender)
                 draft_body = draft.draft_body
                 draft_subject = draft.subject_line
-                draft_result = create_draft_reply(token, message_id, draft_body)
+                action_required = draft.action_required
+
+                if action_required:
+                    full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft_body}"
+                else:
+                    full_draft_body = draft_body
+
+                draft_result = create_draft_reply(token, message_id, full_draft_body)
                 draft_status = "Draft saved to Outlook" if draft_result else "Failed to save draft"
             except Exception as e:
                 draft_status = f"Drafting failed: {str(e)}"
+                action_required = None
 
         results.append({
             "subject": subject,
@@ -197,7 +242,8 @@ def process_emails():
             "triage_reason": triage_reason,
             "draft_body": draft_body,
             "draft_subject": draft_subject,
-            "draft_status": draft_status
+            "draft_status": draft_status,
+            "action_required": action_required
         })
 
     return results
@@ -218,6 +264,17 @@ def dashboard():
         draft_subject = r.get("draft_subject", "")
         triage_reason = r.get("triage_reason", "")
 
+
+        action_required = r.get("action_required")
+
+        action_section = ""
+        if action_required:
+            action_section = f"""
+            <div style='margin-top:12px;background:#FFF3CD;border-radius:8px;padding:12px;border-left:4px solid #F39C12;'>
+                <p style='font-size:11px;font-weight:600;color:#856404;text-transform:uppercase;margin-bottom:4px;'>Action Required Before Sending</p>
+                <p style='font-size:13px;color:#856404;'>{action_required}</p>
+            </div>"""
+
         draft_section = ""
         if draft_body:
             draft_section = f"""
@@ -235,19 +292,20 @@ def dashboard():
 
         cards += f"""
         <div style='background:white;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);border-left:5px solid {status_color};'>
-            <div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;'>
-                <div style='flex:1;'>
-                    <p style='margin:0 0 4px 0;font-weight:600;font-size:15px;color:#2C3E50;'>{r["subject"]}</p>
-                    <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>From: {r["sender"]}</p>
-                    <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>Received: {r["received"]}</p>
-                    <p style='margin:6px 0 0 0;font-size:13px;color:#555;'>{triage_reason}</p>
-                    {draft_status_html}
-                </div>
-                <div style='text-align:right;'>
-                    <span style='background:{status_color};color:white;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;'>{status_label}</span>
-                </div>
-            </div>
-            {draft_section}
+    <div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;'>
+        <div style='flex:1;'>
+            <p style='margin:0 0 4px 0;font-weight:600;font-size:15px;color:#2C3E50;'>{r["subject"]}</p>
+            <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>From: {r["sender"]}</p>
+            <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>Received: {r["received"]}</p>
+            <p style='margin:6px 0 0 0;font-size:13px;color:#555;'>{triage_reason}</p>
+            {draft_status_html}
+        </div>
+        <div style='text-align:right;'>
+            <span style='background:{status_color};color:white;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;'>{status_label}</span>
+        </div>
+    </div>
+    {action_section}
+    {draft_section}
         </div>"""
 
     total = len(results)
