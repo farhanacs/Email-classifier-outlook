@@ -136,12 +136,26 @@ def register_webhook(notification_url: str):
     global current_subscription_id
     try:
         token = get_access_token()
-        url = "https://graph.microsoft.com/v1.0/subscriptions"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
 
+        # Delete all existing subscriptions first
+        existing = requests.get(
+            "https://graph.microsoft.com/v1.0/subscriptions",
+            headers=headers
+        )
+        if existing.status_code == 200:
+            for sub in existing.json().get("value", []):
+                sub_id = sub.get("id")
+                requests.delete(
+                    f"https://graph.microsoft.com/v1.0/subscriptions/{sub_id}",
+                    headers=headers
+                )
+                logger.info(f"Deleted existing subscription: {sub_id}")
+
+        # Register new subscription
         expiry = (datetime.now(timezone.utc) + timedelta(minutes=4200)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
         payload = {
@@ -152,7 +166,11 @@ def register_webhook(notification_url: str):
             "clientState": "ietlabs-secret-state"
         }
 
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(
+            "https://graph.microsoft.com/v1.0/subscriptions",
+            headers=headers,
+            json=payload
+        )
         result = response.json()
 
         if response.status_code == 201:
@@ -166,7 +184,6 @@ def register_webhook(notification_url: str):
     except Exception as e:
         logger.error(f"Exception registering webhook: {str(e)}")
         return None
-
 
 # ── AUTO RENEWAL ──────────────────────────────────────────────────────────────
 def renew_webhook():
