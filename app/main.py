@@ -1,96 +1,227 @@
 import anthropic
 import requests
 import os
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Optional
+import asyncio
+from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from models import TriageResult, DraftResult
+from datetime import datetime, timezone, timedelta
+from database import init_db, is_already_processed, mark_as_processed
+from logger import get_logger
+from pydantic import BaseModel
+from typing import Optional
 
 load_dotenv()
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
+# ── LOGGER ────────────────────────────────────────────────────────────────────
+logger = get_logger("iet-email-agent")
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 TENANT_ID = os.getenv("TENANT_ID")
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+RENDER_URL = os.getenv("RENDER_URL")
 
-
-
-# ── INIT ─────────────────────────────────────────────────────────────────────
-app = FastAPI()
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+current_subscription_id = None
 
-# ── MICROSOFT GRAPH ──────────────────────────────────────────────────────────
+# ── PYDANTIC MODELS ───────────────────────────────────────────────────────────
+class SettingsUpdate(BaseModel):
+    custom_instructions: str
+
+
+# ── MICROSOFT GRAPH ───────────────────────────────────────────────────────────
 def get_access_token():
-    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default"
-    }
-    response = requests.post(url, data=data)
-    return response.json().get("access_token")
-
-
-def get_emails(token, count=10):
-    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages?$top={count}&$orderby=receivedDateTime desc&$select=id,subject,body,from,receivedDateTime,conversationId"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    return response.json().get("value", [])
-
-def create_draft_reply(token, message_id, draft_body):
-    url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}/createReply"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    print(f"\n--- CREATE DRAFT REPLY ---")
-    print(f"Message ID: {message_id}")
-    print(f"URL: {url}")
-
-    response = requests.post(url, headers=headers)
-
-    print(f"Create Reply Status Code: {response.status_code}")
-    print(f"Create Reply Response: {response.text}")
-
-    if response.status_code != 201:
-        print(f"FAILED at createReply step — status code {response.status_code}")
+    try:
+        url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default"
+        }
+        response = requests.post(url, data=data)
+        token = response.json().get("access_token")
+        if not token:
+            logger.error(f"Failed to get access token: {response.json()}")
+        return token
+    except Exception as e:
+        logger.error(f"Exception getting access token: {str(e)}")
         return None
 
-    draft = response.json()
-    draft_id = draft.get("id")
-    print(f"Draft ID: {draft_id}")
 
-    update_url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{draft_id}"
-    update_payload = {
-        "body": {
-            "contentType": "Text",
-            "content": draft_body
-        },
-        "categories": ["AI generated"],
-        "subject": draft.get("subject", "")
-    }
-
-    print(f"Update URL: {update_url}")
-    print(f"Draft Body Preview: {draft_body[:200]}")
-
-    update_response = requests.patch(update_url, headers=headers, json=update_payload)
-
-    print(f"Update Status Code: {update_response.status_code}")
-    print(f"Update Response: {update_response.text}")
-    print(f"--- END CREATE DRAFT REPLY ---\n")
-
-    return update_response.json()
+def get_emails(token, count=20):
+    try:
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages?$top={count}&$orderby=receivedDateTime desc&$select=id,subject,body,from,receivedDateTime,conversationId"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers)
+        return response.json().get("value", [])
+    except Exception as e:
+        logger.error(f"Exception fetching emails: {str(e)}")
+        return []
 
 
-# ── AGENT 1: TRIAGE ──────────────────────────────────────────────────────────
+def fetch_single_email(token, message_id):
+    try:
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        logger.error(f"Failed to fetch email {message_id} — status {response.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Exception fetching single email: {str(e)}")
+        return None
+
+
+def create_draft_reply(token, message_id, draft_body, original_html=""):
+    try:
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}/createReply"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(url, headers=headers)
+
+        if response.status_code != 201:
+            logger.error(f"Failed to create reply — status {response.status_code}: {response.text}")
+            return None
+
+        draft = response.json()
+        draft_id = draft.get("id")
+
+        # Format draft body as HTML and preserve original email thread below
+        html_body = f"""
+<div style='font-family:Arial,sans-serif;font-size:11pt;color:#000000;'>
+{draft_body.replace(chr(10), '<br>')}
+</div>
+<br><br>
+{original_html}
+"""
+
+        update_url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{draft_id}"
+        update_payload = {
+            "body": {
+                "contentType": "HTML",
+                "content": html_body
+            },
+            "categories": ["AI generated"],
+            "subject": draft.get("subject", "")
+        }
+
+        update_response = requests.patch(update_url, headers=headers, json=update_payload)
+
+        if update_response.status_code != 200:
+            logger.error(f"Failed to update draft — status {update_response.status_code}: {update_response.text}")
+            return None
+
+        logger.info(f"Draft created successfully for message: {message_id}")
+        return update_response.json()
+
+    except Exception as e:
+        logger.error(f"Exception creating draft: {str(e)}")
+        return None
+
+
+# ── WEBHOOK REGISTRATION ──────────────────────────────────────────────────────
+def register_webhook(notification_url: str):
+    global current_subscription_id
+    try:
+        token = get_access_token()
+        url = "https://graph.microsoft.com/v1.0/subscriptions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        expiry = (datetime.now(timezone.utc) + timedelta(minutes=4200)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+
+        payload = {
+            "changeType": "created",
+            "notificationUrl": f"{notification_url}/webhook",
+            "resource": f"users/{EMAIL_ADDRESS}/mailfolders('Inbox')/messages",
+            "expirationDateTime": expiry,
+            "clientState": "ietlabs-secret-state"
+        }
+
+        response = requests.post(url, headers=headers, json=payload)
+        result = response.json()
+
+        if response.status_code == 201:
+            current_subscription_id = result.get("id")
+            logger.info(f"Webhook registered. ID: {current_subscription_id} Expires: {expiry}")
+        else:
+            logger.error(f"Failed to register webhook: {result}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Exception registering webhook: {str(e)}")
+        return None
+
+
+# ── AUTO RENEWAL ──────────────────────────────────────────────────────────────
+def renew_webhook():
+    global current_subscription_id
+    if not current_subscription_id:
+        logger.warning("No subscription ID — re-registering webhook")
+        register_webhook(RENDER_URL)
+        return
+
+    try:
+        token = get_access_token()
+        url = f"https://graph.microsoft.com/v1.0/subscriptions/{current_subscription_id}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        new_expiry = (datetime.now(timezone.utc) + timedelta(minutes=4200)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        payload = {"expirationDateTime": new_expiry}
+
+        response = requests.patch(url, headers=headers, json=payload)
+
+        if response.status_code == 200:
+            logger.info(f"Webhook renewed until {new_expiry}")
+        else:
+            logger.error(f"Failed to renew — status {response.status_code}: {response.text}")
+            logger.info("Re-registering webhook")
+            register_webhook(RENDER_URL)
+
+    except Exception as e:
+        logger.error(f"Exception renewing webhook: {str(e)}")
+
+
+async def auto_renew_loop():
+    while True:
+        await asyncio.sleep(20 * 60 * 60)
+        logger.info("Running scheduled webhook renewal")
+        renew_webhook()
+
+
+# ── SETTINGS / PROMPT INJECTION ───────────────────────────────────────────────
+def get_custom_instructions() -> str:
+    try:
+        from database import get_settings, SessionLocal
+        with SessionLocal() as session:
+            settings = get_settings(session)
+            return settings.custom_instructions if settings else ""
+    except Exception as e:
+        logger.error(f"Failed to get custom instructions: {str(e)}")
+        return ""
+
+
+# ── AGENTS ────────────────────────────────────────────────────────────────────
 def triage_email(subject, body, sender) -> TriageResult:
-    prompt = f"""You are a triage agent for IET Labs, a manufacturer of test and measurement equipment.
+    try:
+        prompt = f"""You are a triage agent for IET Labs, a manufacturer of test and measurement equipment.
 
 Read the following email and decide if it needs a response or not.
 
@@ -115,20 +246,36 @@ Sender: {sender}
 Subject: {subject}
 Body: {body[:2000]}"""
 
-    response = anthropic_client.messages.parse(
-        model="claude-sonnet-4-6",
-        max_tokens=5000,
-        output_format=TriageResult,
-        messages=[{"role": "user", "content": prompt}]
-    )
+        response = anthropic_client.messages.parse(
+            model="claude-sonnet-4-6",
+            max_tokens=5000,
+            output_format=TriageResult,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].parsed_output
 
-    return response.content[0].parsed_output
+    except Exception as e:
+        logger.error(f"Triage failed for {sender}: {str(e)}")
+        raise
+
 
 def draft_response(subject, body, sender) -> DraftResult:
-    prompt = f"""You are a helpful assistant drafting email responses on behalf of IET Labs, a world leading manufacturer of test and measurement equipment including resistors capacitors and inductors.
+    try:
+        custom_instructions = get_custom_instructions()
+
+        custom_block = ""
+        if custom_instructions:
+            custom_block = f"""
+CUSTOM INSTRUCTIONS FROM IET LABS — follow these in addition to all rules below:
+{custom_instructions}
+---
+"""
+
+        prompt = f"""You are a helpful assistant drafting email responses on behalf of IET Labs, a world leading manufacturer of test and measurement equipment including resistors capacitors and inductors.
 
 Draft a professional and concise response to the following email.
 
+{custom_block}
 STRICT RULES — you must follow these without exception:
 
 1. NEVER use vague filler phrases such as:
@@ -139,7 +286,7 @@ STRICT RULES — you must follow these without exception:
    - "we will keep you updated"
    - "thank you for reaching out we will respond soon"
    - Any similar non-committal language that provides no value to the customer
-   
+
 2. Every response must be specific and actionable. If you do not have enough information to give a specific response then ask clearly for the missing information.
 
 3. If the email requires a manual action by an IET staff member before the response can be sent such as pulling invoices checking an order printing a document or looking up a tracking number then:
@@ -156,7 +303,7 @@ STRICT RULES — you must follow these without exception:
    - General question: Answer it directly and specifically
 
 5. Do not make up specific prices lead times or product details
-6. Never ask for information that has already been provided in the email. Read the full email carefully and use any details already given.
+6. Never ask for information that has already been provided in the email
 7. Sign off as IET Labs Sales Team
 
 Email details:
@@ -164,18 +311,132 @@ Sender: {sender}
 Subject: {subject}
 Body: {body[:2000]}"""
 
-    response = anthropic_client.messages.parse(
-        model="claude-sonnet-4-6",
-        max_tokens=5000,
-        output_format=DraftResult,
-        messages=[{"role": "user", "content": prompt}]
-    )
+        response = anthropic_client.messages.parse(
+            model="claude-sonnet-4-6",
+            max_tokens=5000,
+            output_format=DraftResult,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].parsed_output
 
-    return response.content[0].parsed_output
+    except Exception as e:
+        logger.error(f"Drafting failed for {sender}: {str(e)}")
+        raise
 
 
-# ── PROCESS EMAILS ───────────────────────────────────────────────────────────
-def process_emails():
+# ── PROCESS SINGLE EMAIL ──────────────────────────────────────────────────────
+def process_single_email(message_id: str):
+    try:
+        if is_already_processed(message_id):
+            logger.info(f"Email {message_id} already processed — skipping")
+            return
+
+        token = get_access_token()
+        email = fetch_single_email(token, message_id)
+
+        if not email:
+            return
+
+        subject = email.get("subject", "No Subject")
+        body = email.get("body", {}).get("content", "")
+        original_html = email.get("body", {}).get("content", "") if email.get("body", {}).get("contentType") == "html" else ""
+        sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+
+        logger.info(f"Processing: '{subject}' from {sender}")
+
+        if sender.lower().endswith("@ietlabs.com"):
+            logger.info(f"Skipping internal email from {sender}")
+            mark_as_processed(message_id)
+            return
+
+        triage = triage_email(subject, body, sender)
+        logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
+
+        if triage.needs_response:
+            draft = draft_response(subject, body, sender)
+            action_required = draft.action_required
+
+            if action_required:
+                full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
+            else:
+                full_draft_body = draft.draft_body
+
+            result = create_draft_reply(token, message_id, full_draft_body, original_html)
+            if result:
+                logger.info(f"Draft created for: {subject}")
+            else:
+                logger.error(f"Failed to create draft for: {subject}")
+
+        mark_as_processed(message_id)
+
+    except Exception as e:
+        logger.error(f"Unhandled exception processing {message_id}: {str(e)}")
+
+
+# ── LIFESPAN ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("Database initialized")
+    asyncio.create_task(auto_renew_loop())
+    logger.info("Auto renewal loop started")
+    yield
+    logger.info("Application shutting down")
+
+
+# ── APP INIT ──────────────────────────────────────────────────────────────────
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── WEBHOOK ENDPOINT ──────────────────────────────────────────────────────────
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    params = request.query_params
+    if "validationToken" in params:
+        logger.info("Webhook validation received")
+        return PlainTextResponse(
+            content=params["validationToken"],
+            status_code=200
+        )
+
+    try:
+        body = await request.json()
+        notifications = body.get("value", [])
+
+        for notification in notifications:
+            if notification.get("clientState") != "ietlabs-secret-state":
+                logger.warning("Invalid client state — ignoring")
+                continue
+
+            resource = notification.get("resource", "")
+            message_id = resource.split("/")[-1]
+            logger.info(f"Notification received for: {message_id}")
+            background_tasks.add_task(process_single_email, message_id)
+
+    except Exception as e:
+        logger.error(f"Exception in webhook: {str(e)}")
+
+    return {"status": "ok"}
+
+
+# ── REGISTER WEBHOOK ──────────────────────────────────────────────────────────
+@app.get("/register-webhook")
+def register_webhook_endpoint():
+    result = register_webhook(RENDER_URL)
+    return result
+
+
+# ── API: GET EMAILS ───────────────────────────────────────────────────────────
+@app.get("/api/emails")
+def get_emails_api():
     token = get_access_token()
     emails = get_emails(token)
     results = []
@@ -186,193 +447,90 @@ def process_emails():
         body = email.get("body", {}).get("content", "")
         sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
-
-        # ── SKIP INTERNAL EMAILS ──────────────────────────────────────────────
-        if sender.lower().endswith("@ietlabs.com"):
-            results.append({
-                "subject": subject,
-                "sender": sender,
-                "received": received,
-                "needs_response": False,
-                "triage_reason": "Skipped — internal IET Labs email",
-                "draft_body": None,
-                "draft_subject": None,
-                "draft_status": None,
-                "action_required": None
-            })
-            continue
-
-        needs_response = False
-        triage_reason = ""
-        draft_body = None
-        draft_subject = None
-        draft_status = None
-        action_required = None
-
-        try:
-            triage: TriageResult = triage_email(subject, body, sender)
-            needs_response = triage.needs_response
-            triage_reason = triage.reason
-        except Exception as e:
-            triage_reason = f"Triage failed: {str(e)}"
-
-        if needs_response:
-            try:
-                draft: DraftResult = draft_response(subject, body, sender)
-                draft_body = draft.draft_body
-                draft_subject = draft.subject_line
-                action_required = draft.action_required
-
-                if action_required:
-                    full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft_body}"
-                else:
-                    full_draft_body = draft_body
-
-                draft_result = create_draft_reply(token, message_id, full_draft_body)
-                draft_status = "Draft saved to Outlook" if draft_result else "Failed to save draft"
-            except Exception as e:
-                draft_status = f"Drafting failed: {str(e)}"
-                action_required = None
+        already_processed = is_already_processed(message_id)
 
         results.append({
+            "message_id": message_id,
             "subject": subject,
             "sender": sender,
             "received": received,
-            "needs_response": needs_response,
-            "triage_reason": triage_reason,
-            "draft_body": draft_body,
-            "draft_subject": draft_subject,
-            "draft_status": draft_status,
-            "action_required": action_required
+            "already_processed": already_processed,
+            "body_preview": body[:300]
         })
 
     return results
 
 
-# ── DASHBOARD ────────────────────────────────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def dashboard():
-    results = process_emails()
+# ── API: ON DEMAND PROCESS EMAIL ──────────────────────────────────────────────
+@app.post("/api/process-email/{message_id}")
+async def process_email_on_demand(message_id: str, background_tasks: BackgroundTasks):
+    if is_already_processed(message_id):
+        return {"status": "already_processed", "message": "This email has already been processed"}
 
-    cards = ""
-    for r in results:
-        needs_response = r.get("needs_response", False)
-        status_color = "#27AE60" if needs_response else "#95A5A6"
-        status_label = "Response Needed" if needs_response else "No Response Needed"
-        draft_status = r.get("draft_status", "")
-        draft_body = r.get("draft_body", "")
-        draft_subject = r.get("draft_subject", "")
-        triage_reason = r.get("triage_reason", "")
+    background_tasks.add_task(process_single_email, message_id)
+    return {"status": "processing", "message": "Email is being processed in the background"}
 
 
-        action_required = r.get("action_required")
+# ── API: STATS ────────────────────────────────────────────────────────────────
+@app.get("/api/stats")
+def get_stats():
+    try:
+        from database import SessionLocal, ProcessedEmail
+        from sqlalchemy import func
+        today = datetime.now(timezone.utc).date()
 
-        action_section = ""
-        if action_required:
-            action_section = f"""
-            <div style='margin-top:12px;background:#FFF3CD;border-radius:8px;padding:12px;border-left:4px solid #F39C12;'>
-                <p style='font-size:11px;font-weight:600;color:#856404;text-transform:uppercase;margin-bottom:4px;'>Action Required Before Sending</p>
-                <p style='font-size:13px;color:#856404;'>{action_required}</p>
-            </div>"""
+        with SessionLocal() as session:
+            total_processed = session.query(func.count(ProcessedEmail.message_id)).scalar()
+            processed_today = session.query(func.count(ProcessedEmail.message_id)).filter(
+                func.date(ProcessedEmail.processed_at) == today
+            ).scalar()
 
-        draft_section = ""
-        if draft_body:
-            draft_section = f"""
-            <div style='margin-top:12px;background:#F8F9FA;border-radius:8px;padding:12px;'>
-                <p style='font-size:11px;font-weight:600;color:#666;text-transform:uppercase;margin-bottom:4px;'>Draft Subject</p>
-                <p style='font-size:13px;color:#2C3E50;margin-bottom:10px;'>{draft_subject}</p>
-                <p style='font-size:11px;font-weight:600;color:#666;text-transform:uppercase;margin-bottom:4px;'>Draft Response</p>
-                <p style='font-size:13px;color:#2C3E50;white-space:pre-wrap;'>{draft_body}</p>
-            </div>"""
-
-        draft_status_html = ""
-        if draft_status:
-            ds_color = "#27AE60" if "saved" in draft_status.lower() else "#E74C3C"
-            draft_status_html = f"<span style='font-size:11px;color:{ds_color};font-weight:600;'>{draft_status}</span>"
-
-        cards += f"""
-        <div style='background:white;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);border-left:5px solid {status_color};'>
-    <div style='display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;'>
-        <div style='flex:1;'>
-            <p style='margin:0 0 4px 0;font-weight:600;font-size:15px;color:#2C3E50;'>{r["subject"]}</p>
-            <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>From: {r["sender"]}</p>
-            <p style='margin:0 0 4px 0;font-size:12px;color:#666;'>Received: {r["received"]}</p>
-            <p style='margin:6px 0 0 0;font-size:13px;color:#555;'>{triage_reason}</p>
-            {draft_status_html}
-        </div>
-        <div style='text-align:right;'>
-            <span style='background:{status_color};color:white;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;'>{status_label}</span>
-        </div>
-    </div>
-    {action_section}
-    {draft_section}
-        </div>"""
-
-    total = len(results)
-    drafted = sum(1 for r in results if r.get("needs_response"))
-    skipped = total - drafted
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>IET Labs Email Drafting Agent</title>
-        <meta charset='utf-8'>
-        <meta name='viewport' content='width=device-width, initial-scale=1'>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F0F2F5; min-height: 100vh; }}
-            .header {{ background: #2C3E50; color: white; padding: 20px 32px; display: flex; justify-content: space-between; align-items: center; }}
-            .header h1 {{ font-size: 20px; font-weight: 600; }}
-            .header p {{ font-size: 13px; opacity: 0.7; margin-top: 4px; }}
-            .refresh-btn {{ background: #3498DB; color: white; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }}
-            .refresh-btn:hover {{ background: #2980B9; }}
-            .container {{ max-width: 960px; margin: 0 auto; padding: 24px 16px; }}
-            .stats {{ display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }}
-            .stat-box {{ background: white; border-radius: 10px; padding: 16px 24px; box-shadow: 0 2px 6px rgba(0,0,0,0.06); }}
-            .stat-box p:first-child {{ font-size: 28px; font-weight: 700; color: #2C3E50; }}
-            .stat-box p:last-child {{ font-size: 12px; color: #666; margin-top: 4px; }}
-            .section-title {{ font-size: 14px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }}
-        </style>
-    </head>
-    <body>
-        <div class='header'>
-            <div>
-                <h1>IET Labs Email Drafting Agent</h1>
-                <p>Powered by Claude</p>
-            </div>
-            <button class='refresh-btn' onclick='window.location.reload()'>Refresh</button>
-        </div>
-        <div class='container'>
-            <div class='stats'>
-                <div class='stat-box'>
-                    <p>{total}</p>
-                    <p>Emails Processed</p>
-                </div>
-                <div class='stat-box'>
-                    <p style='color:#27AE60;'>{drafted}</p>
-                    <p>Drafts Created</p>
-                </div>
-                <div class='stat-box'>
-                    <p style='color:#95A5A6;'>{skipped}</p>
-                    <p>Skipped</p>
-                </div>
-            </div>
-            <p class='section-title'>Processed Emails</p>
-            {cards}
-        </div>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
+        return {
+            "total_processed": total_processed,
+            "processed_today": processed_today,
+            "webhook_active": current_subscription_id is not None,
+            "subscription_id": current_subscription_id
+        }
+    except Exception as e:
+        logger.error(f"Error getting stats: {str(e)}")
+        return {"error": str(e)}
 
 
-@app.get("/api/emails")
-def get_emails_api():
-    return process_emails()
+# ── API: GET SETTINGS ─────────────────────────────────────────────────────────
+@app.get("/api/settings")
+def get_settings_api():
+    try:
+        from database import SessionLocal, Settings
+        with SessionLocal() as session:
+            settings = session.query(Settings).first()
+            if settings:
+                return {"custom_instructions": settings.custom_instructions}
+            return {"custom_instructions": ""}
+    except Exception as e:
+        logger.error(f"Error getting settings: {str(e)}")
+        return {"custom_instructions": ""}
 
 
-# ── RUN ──────────────────────────────────────────────────────────────────────
+# ── API: SAVE SETTINGS ────────────────────────────────────────────────────────
+@app.post("/api/settings")
+def save_settings_api(data: SettingsUpdate):
+    try:
+        from database import SessionLocal, Settings
+        with SessionLocal() as session:
+            settings = session.query(Settings).first()
+            if settings:
+                settings.custom_instructions = data.custom_instructions
+            else:
+                session.add(Settings(custom_instructions=data.custom_instructions))
+            session.commit()
+            logger.info("Custom instructions updated")
+            return {"status": "saved", "custom_instructions": data.custom_instructions}
+    except Exception as e:
+        logger.error(f"Error saving settings: {str(e)}")
+        return {"error": str(e)}
+
+
+# ── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
