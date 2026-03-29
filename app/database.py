@@ -38,11 +38,19 @@ def is_already_processed(message_id: str) -> bool:
         return result is not None
 
 
+# def mark_as_processed(message_id: str):
+#     with SessionLocal() as session:
+#         if not session.get(ProcessedEmail, message_id):
+#             session.add(ProcessedEmail(message_id=message_id))
+#             session.commit()
+
 def mark_as_processed(message_id: str):
     with SessionLocal() as session:
-        if not session.get(ProcessedEmail, message_id):
+        try:
             session.add(ProcessedEmail(message_id=message_id))
             session.commit()
+        except Exception:
+            session.rollback()
 
 
 def get_settings(session) -> Settings:
