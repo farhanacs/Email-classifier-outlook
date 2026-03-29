@@ -1,5 +1,6 @@
 from sqlalchemy import create_engine, Column, String, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.dialects.postgresql import insert
 from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
@@ -40,10 +41,12 @@ def is_already_processed(message_id: str) -> bool:
 
 def mark_as_processed(message_id: str):
     with SessionLocal() as session:
-        if not session.get(ProcessedEmail, message_id):
-            session.add(ProcessedEmail(message_id=message_id))
-            session.commit()
-
+        stmt = insert(ProcessedEmail).values(
+            message_id=message_id,
+            processed_at=datetime.now(timezone.utc)
+        ).on_conflict_do_nothing(index_elements=["message_id"])
+        session.execute(stmt)
+        session.commit()
 
 def get_settings(session) -> Settings:
     return session.query(Settings).first()
