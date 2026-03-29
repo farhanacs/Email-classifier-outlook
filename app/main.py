@@ -7,10 +7,10 @@ from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
-from models import TriageResult, DraftResult
+from app.models import TriageResult, DraftResult
 from datetime import datetime, timezone, timedelta
-from database import init_db, is_already_processed, mark_as_processed
-from logger import get_logger
+from app.database import init_db, is_already_processed, mark_as_processed
+from app.logger import get_logger
 from pydantic import BaseModel
 from typing import Optional
 
