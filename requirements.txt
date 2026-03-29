@@ -3,4 +3,5 @@ uvicorn
 anthropic
 requests
 python-dotenv
-apscheduler
+sqlalchemy
+psycopg2-binary
