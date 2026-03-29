@@ -9,10 +9,11 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from app.models import TriageResult, DraftResult
 from datetime import datetime, timezone, timedelta
-from app.database import init_db, is_already_processed, mark_as_processed
+from app.database import init_db, is_already_processed, mark_as_processed, SessionLocal, ProcessedEmail, Settings
 from app.logger import get_logger
 from pydantic import BaseModel
 from typing import Optional
+from sqlalchemy import func
 
 load_dotenv()
 
@@ -209,14 +210,12 @@ async def auto_renew_loop():
 # ── SETTINGS / PROMPT INJECTION ───────────────────────────────────────────────
 def get_custom_instructions() -> str:
     try:
-        from database import get_settings, SessionLocal
         with SessionLocal() as session:
-            settings = get_settings(session)
+            settings = session.query(Settings).first()
             return settings.custom_instructions if settings else ""
     except Exception as e:
         logger.error(f"Failed to get custom instructions: {str(e)}")
         return ""
-
 
 # ── AGENTS ────────────────────────────────────────────────────────────────────
 def triage_email(subject, body, sender) -> TriageResult:
@@ -447,6 +446,11 @@ def get_emails_api():
         body = email.get("body", {}).get("content", "")
         sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
+
+        # Skip internal and outgoing emails
+        if sender.lower().endswith("@ietlabs.com"):
+            continue
+
         already_processed = is_already_processed(message_id)
 
         results.append({
@@ -475,8 +479,6 @@ async def process_email_on_demand(message_id: str, background_tasks: BackgroundT
 @app.get("/api/stats")
 def get_stats():
     try:
-        from database import SessionLocal, ProcessedEmail
-        from sqlalchemy import func
         today = datetime.now(timezone.utc).date()
 
         with SessionLocal() as session:
@@ -500,7 +502,6 @@ def get_stats():
 @app.get("/api/settings")
 def get_settings_api():
     try:
-        from database import SessionLocal, Settings
         with SessionLocal() as session:
             settings = session.query(Settings).first()
             if settings:
@@ -515,7 +516,6 @@ def get_settings_api():
 @app.post("/api/settings")
 def save_settings_api(data: SettingsUpdate):
     try:
-        from database import SessionLocal, Settings
         with SessionLocal() as session:
             settings = session.query(Settings).first()
             if settings:
