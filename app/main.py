@@ -636,17 +636,38 @@ def get_stats():
 
 
 # ── API: GET SETTINGS ─────────────────────────────────────────────────────────
-@app.get("/api/settings")
-def get_settings_api():
+# @app.get("/api/settings")
+# def get_settings_api():
+#     try:
+#         with SessionLocal() as session:
+#             settings = session.query(Settings).first()
+#             if settings:
+#                 return {"custom_instructions": settings.custom_instructions}
+#             return {"custom_instructions": ""}
+#     except Exception as e:
+#         logger.error(f"Error getting settings: {str(e)}")
+#         return {"custom_instructions": ""}
+
+@app.post("/api/settings")
+def save_settings_api(data: SettingsUpdate):
     try:
         with SessionLocal() as session:
             settings = session.query(Settings).first()
             if settings:
-                return {"custom_instructions": settings.custom_instructions}
-            return {"custom_instructions": ""}
+                # Append to existing instructions
+                existing = settings.custom_instructions or ""
+                if existing.strip():
+                    settings.custom_instructions = existing.strip() + "\n" + data.custom_instructions.strip()
+                else:
+                    settings.custom_instructions = data.custom_instructions.strip()
+            else:
+                session.add(Settings(custom_instructions=data.custom_instructions.strip()))
+            session.commit()
+            logger.info("Custom instructions updated")
+            return {"status": "saved", "custom_instructions": settings.custom_instructions if settings else data.custom_instructions}
     except Exception as e:
-        logger.error(f"Error getting settings: {str(e)}")
-        return {"custom_instructions": ""}
+        logger.error(f"Error saving settings: {str(e)}")
+        return {"error": str(e)}
 
 
 # ── API: SAVE SETTINGS ────────────────────────────────────────────────────────
