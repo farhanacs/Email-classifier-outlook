@@ -82,7 +82,19 @@ def get_emails(token, count=20):
         logger.error(f"Exception fetching emails: {str(e)}")
         return []
 
-
+def get_email_attachments(token, message_id):
+    try:
+        url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}/attachments?$select=name,contentType,size"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            attachments = response.json().get("value", [])
+            return [a.get("name", "unknown") for a in attachments]
+        return []
+    except Exception as e:
+        logger.error(f"Failed to fetch attachments for {message_id}: {str(e)}")
+        return []
+    
 def fetch_single_email(token, message_id):
     try:
         url = f"https://graph.microsoft.com/v1.0/users/{EMAIL_ADDRESS}/messages/{message_id}"
@@ -251,8 +263,10 @@ def get_custom_instructions() -> str:
         return ""
 
 # ── AGENTS ────────────────────────────────────────────────────────────────────
-def triage_email(subject, body, sender) -> TriageResult:
+def triage_email(subject, body, sender, has_attachments, attachment_names) -> TriageResult:
     try:
+        attachment_info = f"Yes — files: {attachment_names}" if has_attachments else "No"
+
         prompt = f"""You are a triage agent for IET Labs, a manufacturer of test and measurement equipment.
 
 Read the following email and decide if it needs a response or not.
@@ -274,8 +288,9 @@ Emails that DO need a response:
 - Any email with a clear question or request
 
 Email details:
-Sender: {sender}
-Subject: {subject}
+Sender: {sender}n\
+Subject: {subject}\n
+Has Attachments: {attachment_info}\n
 Body: {body}"""
 
         response = anthropic_client.messages.parse(
@@ -291,9 +306,10 @@ Body: {body}"""
         raise
 
 
-def draft_response(subject, body, sender) -> DraftResult:
+def draft_response(subject, body, sender, has_attachments, attachment_names) -> DraftResult:
     try:
         custom_instructions = get_custom_instructions()
+        attachment_info = f"Yes — files: {attachment_names}" if has_attachments else "No"
 
         custom_block = ""
         if custom_instructions:
@@ -341,6 +357,7 @@ STRICT RULES — you must follow these without exception:
 Email details:
 Sender: {sender}
 Subject: {subject}
+Has Attachments: {attachment_info}
 Body: {body}"""
 
         response = anthropic_client.messages.parse(
@@ -423,6 +440,10 @@ def process_single_email(message_id: str):
         sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
 
+        attachments = get_email_attachments(token, message_id)
+        has_attachments = len(attachments) > 0
+        attachment_names = ", ".join(attachments) if attachments else "none"
+
         logger.info(f"Processing: '{subject}' from {sender}")
 
         # Skip internal emails
@@ -443,7 +464,7 @@ def process_single_email(message_id: str):
             return
 
         # Triage
-        triage = triage_email(subject, body, sender)
+        triage = triage_email(subject, body, sender,  has_attachments, attachment_names)
         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
 
         if not triage.needs_response:
@@ -462,7 +483,7 @@ def process_single_email(message_id: str):
             return
 
         # Draft
-        draft           = draft_response(subject, body, sender)
+        draft           = draft_response(subject, body, sender, has_attachments, attachment_names)
         action_required = draft.action_required
 
         if action_required:
