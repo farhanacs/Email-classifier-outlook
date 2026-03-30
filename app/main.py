@@ -2,6 +2,7 @@ import anthropic
 import requests
 import os
 import asyncio
+import re
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +45,12 @@ current_subscription_id = None
 class SettingsUpdate(BaseModel):
     custom_instructions: str
 
+def strip_html(html: str) -> str:
+    if not html:
+        return ""
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 # ── MICROSOFT GRAPH ───────────────────────────────────────────────────────────
 def get_access_token():
@@ -269,7 +276,7 @@ Emails that DO need a response:
 Email details:
 Sender: {sender}
 Subject: {subject}
-Body: {body[:2000]}"""
+Body: {body}"""
 
         response = anthropic_client.messages.parse(
             model="claude-sonnet-4-6",
@@ -334,7 +341,7 @@ STRICT RULES — you must follow these without exception:
 Email details:
 Sender: {sender}
 Subject: {subject}
-Body: {body[:2000]}"""
+Body: {body}"""
 
         response = anthropic_client.messages.parse(
             model="claude-sonnet-4-6",
@@ -411,7 +418,7 @@ def process_single_email(message_id: str):
             return
 
         subject  = email.get("subject", "No Subject")
-        body     = email.get("body", {}).get("content", "")
+        body = strip_html(email.get("body", {}).get("content", ""))
         original_html = body if email.get("body", {}).get("contentType", "").lower() == "html" else ""
         sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
