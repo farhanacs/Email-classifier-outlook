@@ -9,11 +9,20 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from app.models import TriageResult, DraftResult
 from datetime import datetime, timezone, timedelta
-from app.database import init_db, is_already_processed, mark_as_processed, SessionLocal, ProcessedEmail, Settings
 from app.logger import get_logger
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import func
+from app.database import (
+    init_db,
+    is_already_processed,
+    mark_as_processed,
+    save_email_log,
+    get_email_logs,
+    SessionLocal,
+    ProcessedEmail,
+    Settings
+)
 
 load_dotenv()
 
@@ -340,7 +349,55 @@ Body: {body[:2000]}"""
         raise
 
 
-# ── PROCESS SINGLE EMAIL ──────────────────────────────────────────────────────
+# # ── PROCESS SINGLE EMAIL ──────────────────────────────────────────────────────
+# def process_single_email(message_id: str):
+#     try:
+#         if is_already_processed(message_id):
+#             logger.info(f"Email {message_id} already processed — skipping")
+#             return
+
+#         token = get_access_token()
+#         email = fetch_single_email(token, message_id)
+
+#         if not email:
+#             return
+
+#         subject = email.get("subject", "No Subject")
+#         body = email.get("body", {}).get("content", "")
+#         original_html = email.get("body", {}).get("content", "") if email.get("body", {}).get("contentType") == "html" else ""
+#         sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+
+#         logger.info(f"Processing: '{subject}' from {sender}")
+
+#         if sender.lower().endswith("@ietlabs.com"):
+#             logger.info(f"Skipping internal email from {sender}")
+#             mark_as_processed(message_id)
+#             return
+
+#         triage = triage_email(subject, body, sender)
+#         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
+
+#         if triage.needs_response:
+#             draft = draft_response(subject, body, sender)
+#             action_required = draft.action_required
+
+#             if action_required:
+#                 full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
+#             else:
+#                 full_draft_body = draft.draft_body
+
+#             result = create_draft_reply(token, message_id, full_draft_body, original_html)
+#             if result:
+#                 logger.info(f"Draft created for: {subject}")
+#             else:
+#                 logger.error(f"Failed to create draft for: {subject}")
+
+#         mark_as_processed(message_id)
+
+#     except Exception as e:
+#         logger.error(f"Unhandled exception processing {message_id}: {str(e)}")
+
+
 def process_single_email(message_id: str):
     try:
         if is_already_processed(message_id):
@@ -353,35 +410,87 @@ def process_single_email(message_id: str):
         if not email:
             return
 
-        subject = email.get("subject", "No Subject")
-        body = email.get("body", {}).get("content", "")
-        original_html = email.get("body", {}).get("content", "") if email.get("body", {}).get("contentType") == "html" else ""
-        sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+        subject  = email.get("subject", "No Subject")
+        body     = email.get("body", {}).get("content", "")
+        original_html = body if email.get("body", {}).get("contentType", "").lower() == "html" else ""
+        sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+        received = email.get("receivedDateTime", "")
 
         logger.info(f"Processing: '{subject}' from {sender}")
 
+        # Skip internal emails
         if sender.lower().endswith("@ietlabs.com"):
             logger.info(f"Skipping internal email from {sender}")
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=False,
+                triage_reason="Internal IET Labs email — skipped automatically",
+                action_required=None,
+                draft_body=None,
+                status="internal"
+            )
             mark_as_processed(message_id)
             return
 
+        # Triage
         triage = triage_email(subject, body, sender)
         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
 
-        if triage.needs_response:
-            draft = draft_response(subject, body, sender)
-            action_required = draft.action_required
+        if not triage.needs_response:
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=False,
+                triage_reason=triage.reason,
+                action_required=None,
+                draft_body=None,
+                status="skipped"
+            )
+            mark_as_processed(message_id)
+            return
 
-            if action_required:
-                full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
-            else:
-                full_draft_body = draft.draft_body
+        # Draft
+        draft           = draft_response(subject, body, sender)
+        action_required = draft.action_required
 
-            result = create_draft_reply(token, message_id, full_draft_body, original_html)
-            if result:
-                logger.info(f"Draft created for: {subject}")
-            else:
-                logger.error(f"Failed to create draft for: {subject}")
+        if action_required:
+            full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
+        else:
+            full_draft_body = draft.draft_body
+
+        result = create_draft_reply(token, message_id, full_draft_body, original_html)
+
+        if result:
+            logger.info(f"Draft created for: {subject}")
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=True,
+                triage_reason=triage.reason,
+                action_required=action_required,
+                draft_body=draft.draft_body,
+                status="draft_saved"
+            )
+        else:
+            logger.error(f"Failed to create draft for: {subject}")
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=True,
+                triage_reason=triage.reason,
+                action_required=action_required,
+                draft_body=draft.draft_body,
+                status="draft_failed"
+            )
 
         mark_as_processed(message_id)
 
@@ -451,35 +560,39 @@ def register_webhook_endpoint():
 
 
 # ── API: GET EMAILS ───────────────────────────────────────────────────────────
+# @app.get("/api/emails")
+# def get_emails_api():
+#     token = get_access_token()
+#     emails = get_emails(token)
+#     results = []
+
+#     for email in emails:
+#         message_id = email.get("id", "")
+#         subject = email.get("subject", "No Subject")
+#         body = email.get("body", {}).get("content", "")
+#         sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+#         received = email.get("receivedDateTime", "")
+
+#         # Skip internal and outgoing emails
+#         if sender.lower().endswith("@ietlabs.com"):
+#             continue
+
+#         already_processed = is_already_processed(message_id)
+
+#         results.append({
+#             "message_id": message_id,
+#             "subject": subject,
+#             "sender": sender,
+#             "received": received,
+#             "already_processed": already_processed,
+#             "body_preview": body[:300]
+#         })
+
+#     return results
+
 @app.get("/api/emails")
 def get_emails_api():
-    token = get_access_token()
-    emails = get_emails(token)
-    results = []
-
-    for email in emails:
-        message_id = email.get("id", "")
-        subject = email.get("subject", "No Subject")
-        body = email.get("body", {}).get("content", "")
-        sender = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
-        received = email.get("receivedDateTime", "")
-
-        # Skip internal and outgoing emails
-        if sender.lower().endswith("@ietlabs.com"):
-            continue
-
-        already_processed = is_already_processed(message_id)
-
-        results.append({
-            "message_id": message_id,
-            "subject": subject,
-            "sender": sender,
-            "received": received,
-            "already_processed": already_processed,
-            "body_preview": body[:300]
-        })
-
-    return results
+    return get_email_logs(limit=50)
 
 
 # ── API: ON DEMAND PROCESS EMAIL ──────────────────────────────────────────────
