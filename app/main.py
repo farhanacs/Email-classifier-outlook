@@ -372,15 +372,12 @@ Body: {body}"""
         logger.error(f"Drafting failed for {sender}: {str(e)}")
         raise
 
-
 def process_single_email(message_id: str):
     try:
-        # 1. Check if we've already done this
         if is_already_processed(message_id):
             logger.info(f"Email {message_id} already processed — skipping")
             return
 
-        # 2. Fetch the email details from Microsoft
         token = get_access_token()
         email = fetch_single_email(token, message_id)
 
@@ -389,6 +386,7 @@ def process_single_email(message_id: str):
 
         subject  = email.get("subject", "No Subject")
         body = strip_html(email.get("body", {}).get("content", ""))
+        original_html = body if email.get("body", {}).get("contentType", "").lower() == "html" else ""
         sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
         received = email.get("receivedDateTime", "")
 
@@ -398,7 +396,7 @@ def process_single_email(message_id: str):
 
         logger.info(f"Processing: '{subject}' from {sender}")
 
-        # 3. Skip internal emails automatically
+        # Skip internal emails
         if sender.lower().endswith("@ietlabs.com"):
             logger.info(f"Skipping internal email from {sender}")
             save_email_log(
@@ -415,7 +413,7 @@ def process_single_email(message_id: str):
             mark_as_processed(message_id)
             return
 
-        # 4. Run Triage (Decide if a reply is needed)
+        # Triage
         triage = triage_email(subject, body, sender,  has_attachments, attachment_names)
         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
 
@@ -434,14 +432,17 @@ def process_single_email(message_id: str):
             mark_as_processed(message_id)
             return
 
-        # 5. Generate AI Draft Response
-        # This writes the response but doesn't send it anywhere yet
-        draft = draft_response(subject, body, sender, has_attachments, attachment_names)
+        # Draft
+        draft           = draft_response(subject, body, sender, has_attachments, attachment_names)
         action_required = draft.action_required
 
-        # 6. Save to Dashboard Database
-        # This makes the response visible on your dashboard immediately
-        logger.info(f"Draft generated and saving to dashboard for: {subject}")
+        if action_required:
+            full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
+        else:
+            full_draft_body = draft.draft_body
+
+        # Outlook drafting is disabled — only save to dashboard
+        logger.info(f"Draft generated for: {subject} — saved to dashboard only")
         save_email_log(
             message_id=message_id,
             subject=subject,
@@ -450,119 +451,42 @@ def process_single_email(message_id: str):
             needs_response=True,
             triage_reason=triage.reason,
             action_required=action_required,
-            draft_body=draft.draft_body, # This is the AI's response text
-            status="dashboard_ready"
+            draft_body=draft.draft_body,
+            status="draft_saved"
         )
+        # result = create_draft_reply(token, message_id, full_draft_body, original_html)
 
-        # 7. Finalize
+        # if result:
+        #     logger.info(f"Draft created for: {subject}")
+        #     save_email_log(
+        #         message_id=message_id,
+        #         subject=subject,
+        #         sender=sender,
+        #         received=received,
+        #         needs_response=True,
+        #         triage_reason=triage.reason,
+        #         action_required=action_required,
+        #         draft_body=draft.draft_body,
+        #         status="draft_saved"
+        #     )
+        # else:
+        #     logger.error(f"Failed to create draft for: {subject}")
+        #     save_email_log(
+        #         message_id=message_id,
+        #         subject=subject,
+        #         sender=sender,
+        #         received=received,
+        #         needs_response=True,
+        #         triage_reason=triage.reason,
+        #         action_required=action_required,
+        #         draft_body=draft.draft_body,
+        #         status="draft_failed"
+        #     )
+
         mark_as_processed(message_id)
 
     except Exception as e:
         logger.error(f"Unhandled exception processing {message_id}: {str(e)}")
-
-
-# def process_single_email(message_id: str):
-#     try:
-#         if is_already_processed(message_id):
-#             logger.info(f"Email {message_id} already processed — skipping")
-#             return
-
-#         token = get_access_token()
-#         email = fetch_single_email(token, message_id)
-
-#         if not email:
-#             return
-
-#         subject  = email.get("subject", "No Subject")
-#         body = strip_html(email.get("body", {}).get("content", ""))
-#         original_html = body if email.get("body", {}).get("contentType", "").lower() == "html" else ""
-#         sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
-#         received = email.get("receivedDateTime", "")
-
-#         attachments = get_email_attachments(token, message_id)
-#         has_attachments = len(attachments) > 0
-#         attachment_names = ", ".join(attachments) if attachments else "none"
-
-#         logger.info(f"Processing: '{subject}' from {sender}")
-
-#         # Skip internal emails
-#         if sender.lower().endswith("@ietlabs.com"):
-#             logger.info(f"Skipping internal email from {sender}")
-#             save_email_log(
-#                 message_id=message_id,
-#                 subject=subject,
-#                 sender=sender,
-#                 received=received,
-#                 needs_response=False,
-#                 triage_reason="Internal IET Labs email — skipped automatically",
-#                 action_required=None,
-#                 draft_body=None,
-#                 status="internal"
-#             )
-#             mark_as_processed(message_id)
-#             return
-
-#         # Triage
-#         triage = triage_email(subject, body, sender,  has_attachments, attachment_names)
-#         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
-
-#         if not triage.needs_response:
-#             save_email_log(
-#                 message_id=message_id,
-#                 subject=subject,
-#                 sender=sender,
-#                 received=received,
-#                 needs_response=False,
-#                 triage_reason=triage.reason,
-#                 action_required=None,
-#                 draft_body=None,
-#                 status="skipped"
-#             )
-#             mark_as_processed(message_id)
-#             return
-
-#         # Draft
-#         draft           = draft_response(subject, body, sender, has_attachments, attachment_names)
-#         action_required = draft.action_required
-
-#         if action_required:
-#             full_draft_body = f"--- ACTION REQUIRED FOR IET STAFF ---\n{action_required}\n--------------------------------------\n\n{draft.draft_body}"
-#         else:
-#             full_draft_body = draft.draft_body
-
-#         # result = create_draft_reply(token, message_id, full_draft_body, original_html)
-
-#         if result:
-#             logger.info(f"Draft created for: {subject}")
-#             save_email_log(
-#                 message_id=message_id,
-#                 subject=subject,
-#                 sender=sender,
-#                 received=received,
-#                 needs_response=True,
-#                 triage_reason=triage.reason,
-#                 action_required=action_required,
-#                 draft_body=draft.draft_body,
-#                 status="draft_saved"
-#             )
-#         else:
-#             logger.error(f"Failed to create draft for: {subject}")
-#             save_email_log(
-#                 message_id=message_id,
-#                 subject=subject,
-#                 sender=sender,
-#                 received=received,
-#                 needs_response=True,
-#                 triage_reason=triage.reason,
-#                 action_required=action_required,
-#                 draft_body=draft.draft_body,
-#                 status="draft_failed"
-#             )
-
-#         mark_as_processed(message_id)
-
-#     except Exception as e:
-#         logger.error(f"Unhandled exception processing {message_id}: {str(e)}")
 
 
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
