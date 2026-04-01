@@ -24,6 +24,7 @@ from app.database import (
     ProcessedEmail,
     Settings
 )
+from app.email_templates import email_templates
 
 load_dotenv()
 
@@ -323,7 +324,18 @@ CUSTOM INSTRUCTIONS FROM IET LABS — follow these in addition to all rules belo
 
 Draft a professional and concise response to the following email.
 
-{custom_block}
+\n\n{custom_block}\n\n
+
+-----------
+
+RESPONSE STYLE — LEARN FROM THESE EXAMPLES:
+The following are the responses written by the IET Labs sales team. These examples define the expected tone, format, level of detail, and writing style. Study them carefully and match this style in every draft you write.
+
+{email_templates}
+
+--- END OF EXAMPLES ---
+
+
 STRICT RULES — you must follow these without exception:
 
 1. NEVER use vague filler phrases such as:
