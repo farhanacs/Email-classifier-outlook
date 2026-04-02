@@ -20,11 +20,17 @@ from app.database import (
     mark_as_processed,
     save_email_log,
     get_email_logs,
+    create_ticket,
+    get_tickets,
+    link_opportunity,
     SessionLocal,
     ProcessedEmail,
-    Settings
+    Settings,
+    EmailLog,
+    find_existing_ticket
 )
 from app.email_templates import email_templates
+
 
 load_dotenv()
 
@@ -307,7 +313,7 @@ Body: {body}"""
         raise
 
 
-def draft_response(subject, body, sender, has_attachments, attachment_names) -> DraftResult:
+def draft_response(subject, body, sender, has_attachments, attachment_names, ticket_number) -> DraftResult:
     try:
         custom_instructions = get_custom_instructions()
         attachment_info = f"Yes — files: {attachment_names}" if has_attachments else "No"
@@ -324,47 +330,48 @@ CUSTOM INSTRUCTIONS FROM IET LABS — follow these in addition to all rules belo
 
 Draft a professional and concise response to the following email.
 
-\n\n{custom_block}\n\n
-
------------
-
-RESPONSE STYLE — LEARN FROM THESE EXAMPLES:
-The following are the responses written by the IET Labs sales team. These examples define the expected tone, format, level of detail, and writing style. Study them carefully and match this style in every draft you write.
-
-{email_templates}
-
---- END OF EXAMPLES ---
-
-
+{custom_block}
 STRICT RULES — you must follow these without exception:
 
-1. NEVER write anything in draft_body that tells the customer an action is pending, being looked into, or will happen in the future. This includes obvious phrases like "we will look into this" and subtle variants like "please allow us a moment", "we need to pull up", "we are reviewing", or "we will follow up". If you cannot give a specific answer without first doing something, use action_required instead and write the draft as if that action is already done.
+1. NEVER use vague filler phrases such as:
+   - "we will look into this"
+   - "we will get back to you"
+   - "we are looking into your request"
+   - "we will follow up shortly"
+   - Any similar non-committal language that provides no value to the customer
 
 2. Every response must be specific and actionable.
 
-3. If completing the response requires any manual action (checking an order, pulling invoices, preparing documents, looking up a tracking number):
-   - Put the instruction for IET staff in action_required only
-   - Write draft_body as if that action is already completed and the result is in hand
-   - Never let the fact that an action is pending appear anywhere in draft_body
+3. TICKET NUMBER — this is critical:
+   - Every email response must include the ticket number {ticket_number} near the bottom before the sign off
+   - Format it exactly like this: Reference: {ticket_number}
+   - This allows the customer and IET Labs team to reference this transaction in all future communications
 
-4. Specific guidelines per email type:
-   - RFQ: Confirm the exact product requested. Set action_required to prepare the quote, then write draft_body as if the quote is ready and being sent with this email
-   - Service or calibration request: Confirm the unit and service scope. Set action_required for any missing info needed before responding
-   - Status request: Set action_required to check the order status, then write draft_body with the actual status as if already retrieved
-   - Purchase order: Confirm the specific order details including product and quantity. Set action_required to process the PO, then write draft_body as if it is confirmed and in the system
-   - Invoice request: Set action_required to locate and attach the invoices, then write draft_body as if invoices are already attached
-   - General question: Answer directly and specifically with no placeholders
+4. ATTACHMENT AWARENESS:
+   - If Has Attachments is Yes acknowledge the attachment and reference it by name if relevant
+   - If Has Attachments is No but the customer mentions an attachment flag this in action_required
 
-5. Do not make up specific prices lead times or product details
-6. Never ask for information that has already been provided in the email
-7. Sign off as IET Labs Sales Team
-8. Never ask the customer what would make a response, quote, or outcome "unacceptable" or any variation of that phrasing. Do not use closing questions that fish for objections. If a question is needed, it must ask for specific missing information only.
+5. If the email requires a manual action before sending:
+   - Set action_required to a clear instruction for IET staff
+   - Write the draft_body assuming that action has been completed
+
+6. Specific guidelines per email type:
+   - RFQ: Confirm the exact product and state a detailed quote is being prepared
+   - Service or calibration: Confirm receipt and ask for serial number if not provided
+   - Status request: Set action_required to check order status then write response assuming you have it
+   - Purchase order: Confirm order details and outline next steps
+   - Invoice request: Set action_required to locate invoices then write as if attached
+   - General question: Answer directly and specifically
+
+7. Do not make up specific prices lead times or product details
+8. Never ask for information already provided in the email
+9. Sign off as IET Labs Sales Team
 
 Email details:
 Sender: {sender}
 Subject: {subject}
 Has Attachments: {attachment_info}
-Body: {body}"""
+Body: {body[:8000]}"""
 
         response = anthropic_client.messages.parse(
             model="claude-sonnet-4-6",
@@ -378,6 +385,7 @@ Body: {body}"""
         logger.error(f"Drafting failed for {sender}: {str(e)}")
         raise
 
+
 def process_single_email(message_id: str):
     try:
         if is_already_processed(message_id):
@@ -390,15 +398,14 @@ def process_single_email(message_id: str):
         if not email:
             return
 
-        subject  = email.get("subject", "No Subject")
-        body = strip_html(email.get("body", {}).get("content", ""))
-        original_html = body if email.get("body", {}).get("contentType", "").lower() == "html" else ""
-        sender   = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
-        received = email.get("receivedDateTime", "")
-
-        attachments = get_email_attachments(token, message_id)
-        has_attachments = len(attachments) > 0
-        attachment_names = ", ".join(attachments) if attachments else "none"
+        subject       = email.get("subject", "No Subject")
+        body          = strip_html(email.get("body", {}).get("content", ""))
+        original_html = email.get("body", {}).get("content", "") if email.get("body", {}).get("contentType", "").lower() == "html" else ""
+        sender        = email.get("from", {}).get("emailAddress", {}).get("address", "Unknown")
+        received      = email.get("receivedDateTime", "")
+        attachments   = get_email_attachments(token, message_id)
+        has_attachments   = len(attachments) > 0
+        attachment_names  = ", ".join(attachments) if attachments else "none"
 
         logger.info(f"Processing: '{subject}' from {sender}")
 
@@ -414,13 +421,14 @@ def process_single_email(message_id: str):
                 triage_reason="Internal IET Labs email — skipped automatically",
                 action_required=None,
                 draft_body=None,
-                status="internal"
+                status="internal",
+                ticket_number=None
             )
             mark_as_processed(message_id)
             return
 
         # Triage
-        triage = triage_email(subject, body, sender,  has_attachments, attachment_names)
+        triage = triage_email(subject, body, sender, has_attachments, attachment_names)
         logger.info(f"Triage: needs_response={triage.needs_response} reason={triage.reason}")
 
         if not triage.needs_response:
@@ -433,13 +441,30 @@ def process_single_email(message_id: str):
                 triage_reason=triage.reason,
                 action_required=None,
                 draft_body=None,
-                status="skipped"
+                status="skipped",
+                ticket_number=None
             )
             mark_as_processed(message_id)
             return
+        existing_ticket = find_existing_ticket(sender)
+        if existing_ticket:
+            ticket_number = existing_ticket
+            logger.info(f"Linked to existing ticket: {ticket_number}")
+        # Create ticket
+
+        else:
+            company = sender.split("@")[1].split(".")[0].capitalize() if "@" in sender else "Unknown"
+            ticket_number = create_ticket(
+                email_message_id=message_id,
+                subject=subject,
+                sender=sender,
+                company=company,
+                ticket_type="product_rfq",  # default — can be refined later with triage
+            )
+            logger.info(f"Ticket created: {ticket_number}")
 
         # Draft
-        draft           = draft_response(subject, body, sender, has_attachments, attachment_names)
+        draft           = draft_response(subject, body, sender, has_attachments, attachment_names, ticket_number)
         action_required = draft.action_required
 
         if action_required:
@@ -447,53 +472,41 @@ def process_single_email(message_id: str):
         else:
             full_draft_body = draft.draft_body
 
-        # Outlook drafting is disabled — only save to dashboard
-        logger.info(f"Draft generated for: {subject} — saved to dashboard only")
-        save_email_log(
-            message_id=message_id,
-            subject=subject,
-            sender=sender,
-            received=received,
-            needs_response=True,
-            triage_reason=triage.reason,
-            action_required=action_required,
-            draft_body=draft.draft_body,
-            status="draft_saved"
-        )
-        # result = create_draft_reply(token, message_id, full_draft_body, original_html)
+        result = create_draft_reply(token, message_id, full_draft_body, original_html)
 
-        # if result:
-        #     logger.info(f"Draft created for: {subject}")
-        #     save_email_log(
-        #         message_id=message_id,
-        #         subject=subject,
-        #         sender=sender,
-        #         received=received,
-        #         needs_response=True,
-        #         triage_reason=triage.reason,
-        #         action_required=action_required,
-        #         draft_body=draft.draft_body,
-        #         status="draft_saved"
-        #     )
-        # else:
-        #     logger.error(f"Failed to create draft for: {subject}")
-        #     save_email_log(
-        #         message_id=message_id,
-        #         subject=subject,
-        #         sender=sender,
-        #         received=received,
-        #         needs_response=True,
-        #         triage_reason=triage.reason,
-        #         action_required=action_required,
-        #         draft_body=draft.draft_body,
-        #         status="draft_failed"
-        #     )
+        if result:
+            logger.info(f"Draft created for: {subject}")
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=True,
+                triage_reason=triage.reason,
+                action_required=action_required,
+                draft_body=draft.draft_body,
+                status="draft_saved",
+                ticket_number=ticket_number
+            )
+        else:
+            logger.error(f"Failed to create draft for: {subject}")
+            save_email_log(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                received=received,
+                needs_response=True,
+                triage_reason=triage.reason,
+                action_required=action_required,
+                draft_body=draft.draft_body,
+                status="draft_failed",
+                ticket_number=ticket_number
+            )
 
         mark_as_processed(message_id)
 
     except Exception as e:
         logger.error(f"Unhandled exception processing {message_id}: {str(e)}")
-
 
 # ── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -678,6 +691,22 @@ def save_settings_api(data: SettingsUpdate):
         return {"error": str(e)}
 
 
+# ── API: GET TICKETS ──────────────────────────────────────────────────────────
+@app.get("/api/tickets")
+def get_tickets_api():
+    return get_tickets(limit=50)
+
+
+# ── API: LINK OPPORTUNITY ─────────────────────────────────────────────────────
+class LinkOpportunityRequest(BaseModel):
+    opportunity_id: str
+
+@app.post("/api/tickets/{ticket_number}/link-opportunity")
+def link_opportunity_api(ticket_number: str, data: LinkOpportunityRequest):
+    success = link_opportunity(ticket_number, data.opportunity_id)
+    if success:
+        return {"status": "linked", "ticket_number": ticket_number, "opportunity_id": data.opportunity_id}
+    return {"error": "Ticket not found"}
 # ── RUN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn

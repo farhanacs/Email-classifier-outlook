@@ -35,11 +35,11 @@ function getAvatarColor(email) {
 
 function StatusBadge({ status }) {
   const map = {
-    draft_saved:  { label: 'Draft Created',      cls: 'bg-emerald-50 text-emerald-600' },
-    draft_failed: { label: 'Draft Failed',        cls: 'bg-red-50 text-red-500' },
-    skipped:      { label: 'No Response Needed',  cls: 'bg-slate-100 text-slate-400' },
-    internal:     { label: 'Internal',            cls: 'bg-slate-100 text-slate-400' },
-    pending:      { label: 'Pending',             cls: 'bg-sky-50 text-sky-500' },
+    draft_saved:  { label: 'Draft Created',     cls: 'bg-emerald-50 text-emerald-600' },
+    draft_failed: { label: 'Draft Failed',       cls: 'bg-red-50 text-red-500' },
+    skipped:      { label: 'No Response Needed', cls: 'bg-slate-100 text-slate-400' },
+    internal:     { label: 'Internal',           cls: 'bg-slate-100 text-slate-400' },
+    pending:      { label: 'Pending',            cls: 'bg-sky-50 text-sky-500' },
   }
   const { label, cls } = map[status] || map.pending
   return (
@@ -79,9 +79,16 @@ export default function EmailCard({ email }) {
 
         {/* Content */}
         <div className="flex-1 min-w-0">
-          <p className="text-slate-800 text-sm font-semibold truncate">
-            {email.subject || 'No Subject'}
-          </p>
+          <div className="flex items-center gap-2 flex-wrap">
+            <p className="text-slate-800 text-sm font-semibold truncate">
+              {email.subject || 'No Subject'}
+            </p>
+            {email.ticket_number && (
+              <span className="inline-flex items-center text-xs font-mono font-medium text-sky-600 bg-sky-50 border border-sky-100 px-2 py-0.5 rounded-lg shrink-0">
+                {email.ticket_number}
+              </span>
+            )}
+          </div>
           <p className="text-slate-400 text-xs truncate mt-0.5">
             {email.sender}
           </p>
@@ -138,7 +145,7 @@ export default function EmailCard({ email }) {
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1.5">
                 Draft Response
               </p>
-              <div className="bg-sky-25 border border-sky-100 rounded-xl px-4 py-3" style={{ background: '#f0f8ff' }}>
+              <div className="border border-sky-100 rounded-xl px-4 py-3" style={{ background: '#f0f8ff' }}>
                 <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">
                   {email.draft_body}
                 </p>
